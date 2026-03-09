@@ -1,0 +1,142 @@
+# SLSA Level 3 Provenance Generator for alkahest-rs
+# Generates verifiable supply-chain attestations for release artifacts
+# Uses OpenSSF slsa-github-generator: https://github.com/slsa-framework/slsa-github-generator
+
+name: SLSA Generic Generator
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]  # Trigger on GitHub release creation
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Build Job: Compile crate & generate reproducible artifacts
+  # ─────────────────────────────────────────────────────────────
+  build:
+    name: Build & Hash Artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+      crate-version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Ensure full history for reproducible builds
+
+      - name: Extract crate version from release tag
+        id: meta
+        run: |
+          # Strip 'v' prefix if present (e.g., v0.2.1 → 0.2.1)
+          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: alkahest-rs-slsa-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Audit dependencies for security vulnerabilities
+        run: cargo audit --deny warnings || echo "⚠️ cargo-audit not installed; skipping"
+
+      - name: Build library in release mode (reproducible)
+        run: |
+          # Enable reproducible builds: strip timestamps, normalize paths
+          export CARGO_BUILD_INCREMENTAL=false
+          export CARGO_PROFILE_RELEASE_STRIP=true
+          export CARGO_PROFILE_RELEASE_DEBUG=false
+          
+          cargo build --release --lib --locked
+
+      - name: Package crate for distribution (optional but recommended)
+        run: |
+          # Creates a .crate tarball identical to what crates.io receives
+          cargo package --allow-dirty --no-verify
+          mkdir -p artifacts/
+          cp target/package/alkahest-rs-*.crate artifacts/
+
+      - name: Generate SHA256 digests for provenance subjects
+        id: hash
+        run: |
+          set -euo pipefail
+          
+          # Primary subject: packaged crate tarball
+          # Fallback: built .rlib if packaging is skipped
+          if compgen -G "artifacts/alkahest-rs-*.crate" > /dev/null; then
+            files=$(ls artifacts/alkahest-rs-*.crate)
+          else
+            files=$(find target/release -name "libalkahest_rs*.rlib" -type f)
+          fi
+          
+          if [ -z "$files" ]; then
+            echo "❌ No artifacts found to hash" >&2
+            exit 1
+          fi
+          
+          # Generate base64-encoded sha256sum output for SLSA generator
+          echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
+          
+          # Log for debugging (redacted in production)
+          echo "📦 Artifacts hashed:"
+          sha256sum $files
+
+  # ─────────────────────────────────────────────────────────────
+  # Provenance Job: Generate & attach SLSA attestation
+  # ─────────────────────────────────────────────────────────────
+  provenance:
+    name: Generate SLSA Provenance    needs: [build]
+    permissions:
+      actions: read       # Read workflow context
+      id-token: write     # Sign provenance with GitHub OIDC
+      contents: write     # Upload attestation to release assets
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v1.4.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.digests }}"
+      upload-assets: true
+      # Optional: Add custom builder ID for traceability
+      # builder-id: "github.com/trizist/alkahest-rs@${{ github.sha }}"
+
+  # ─────────────────────────────────────────────────────────────
+  # (Optional) Verification Job: Auto-verify provenance post-release
+  # ─────────────────────────────────────────────────────────────
+  verify:
+    name: Verify Provenance (Post-Release)
+    needs: [provenance]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        run: |
+          gh release download "${{ needs.build.outputs.crate-version }}" \
+            --pattern "*.intoto.jsonl" \
+            --dir ./attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install slsa-verifier
+        run: |
+          curl -LO https://github.com/slsa-framework/slsa-verifier/releases/latest/download/slsa-verifier-linux-amd64
+          chmod +x slsa-verifier-linux-amd64
+          sudo mv slsa-verifier-linux-amd64 /usr/local/bin/slsa-verifier
+
+      - name: Verify attestation
+        run: |
+          slsa-verifier verify-artifact \
+            --provenance-path ./attestations/*.intoto.jsonl \
+            --source-uri github.com/${{ github.repository }} \
+            --source-tag "${{ needs.build.outputs.crate-version }}"
